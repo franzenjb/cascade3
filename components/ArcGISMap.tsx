@@ -13,6 +13,8 @@ import SimpleLineSymbol from "@arcgis/core/symbols/SimpleLineSymbol";
 import SimpleFillSymbol from "@arcgis/core/symbols/SimpleFillSymbol";
 import TextSymbol from "@arcgis/core/symbols/TextSymbol";
 import esriConfig from "@arcgis/core/config";
+import OAuthInfo from "@arcgis/core/identity/OAuthInfo";
+import IdentityManager from "@arcgis/core/identity/IdentityManager";
 import { STORM_REPORTS } from "@/lib/storm-reports";
 
 // Warning polygon coordinates (same as cascade2)
@@ -38,24 +40,43 @@ export default function ArcGISMap({ stormReportCount, active }: Props) {
   const labelLayerRef = useRef<GraphicsLayer | null>(null);
   const animFrameRef = useRef<number>(0);
 
-  // Initialize map
+  // Initialize map with OAuth
   useEffect(() => {
     if (!containerRef.current) return;
 
-    esriConfig.apiKey = process.env.NEXT_PUBLIC_ARCGIS_CLIENT_ID;
+    const clientId = process.env.NEXT_PUBLIC_ARCGIS_CLIENT_ID || "";
 
-    const map = new Map({
-      basemap: "dark-gray-vector",
+    // Register OAuth app for ArcGIS authentication
+    const oauthInfo = new OAuthInfo({
+      appId: clientId,
+      portalUrl: "https://arc-nhq-gis.maps.arcgis.com",
+      popup: false,
     });
+    IdentityManager.registerOAuthInfos([oauthInfo]);
 
-    const view = new MapView({
-      container: containerRef.current,
-      map,
-      center: [-82.75, 27.93],
-      zoom: 11,
-      ui: { components: ["zoom"] },
-      constraints: { minZoom: 9, maxZoom: 18 },
-    });
+    // Check if already signed in, if not trigger sign-in
+    IdentityManager.checkSignInStatus(oauthInfo.portalUrl + "/sharing")
+      .catch(() => IdentityManager.getCredential(oauthInfo.portalUrl + "/sharing"))
+      .then(() => initMap())
+      .catch((err) => console.error("ArcGIS auth failed:", err));
+
+    let view: MapView | null = null;
+
+    function initMap() {
+      if (!containerRef.current) return;
+
+      const map = new Map({
+        basemap: "dark-gray-vector",
+      });
+
+      view = new MapView({
+        container: containerRef.current,
+        map,
+        center: [-82.75, 27.93],
+        zoom: 11,
+        ui: { components: ["zoom"] },
+        constraints: { minZoom: 9, maxZoom: 18 },
+      });
 
     // Create layers in order (bottom to top)
     const polygonLayer = new GraphicsLayer({ title: "Warning Polygon" });
@@ -92,10 +113,11 @@ export default function ArcGISMap({ stormReportCount, active }: Props) {
       animFrameRef.current = requestAnimationFrame(animate);
     };
     animFrameRef.current = requestAnimationFrame(animate);
+    } // end initMap
 
     return () => {
       cancelAnimationFrame(animFrameRef.current);
-      view.destroy();
+      if (view) view.destroy();
     };
   }, []);
 
