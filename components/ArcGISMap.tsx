@@ -12,10 +12,11 @@ import SimpleMarkerSymbol from "@arcgis/core/symbols/SimpleMarkerSymbol";
 import SimpleLineSymbol from "@arcgis/core/symbols/SimpleLineSymbol";
 import SimpleFillSymbol from "@arcgis/core/symbols/SimpleFillSymbol";
 import TextSymbol from "@arcgis/core/symbols/TextSymbol";
-import esriConfig from "@arcgis/core/config";
-import OAuthInfo from "@arcgis/core/identity/OAuthInfo";
 import IdentityManager from "@arcgis/core/identity/IdentityManager";
 import { STORM_REPORTS } from "@/lib/storm-reports";
+
+const ARC_PORTAL = "https://arc-nhq-gis.maps.arcgis.com";
+const ARC_APP_ID = process.env.NEXT_PUBLIC_ARCGIS_CLIENT_ID || "";
 
 // Warning polygon coordinates (same as cascade2)
 const WARNING_POLYGON = [
@@ -25,6 +26,42 @@ const WARNING_POLYGON = [
   [-82.8114, 28.0183],
   [-82.8714, 27.8383],
 ];
+
+/**
+ * Extract OAuth token from URL hash (after redirect back from ArcGIS).
+ * Returns the token string or null.
+ */
+function extractTokenFromHash(): string | null {
+  const hash = window.location.hash.substring(1);
+  if (!hash) return null;
+  const params: Record<string, string> = {};
+  hash.split("&").forEach((part) => {
+    const [k, v] = part.split("=");
+    params[k] = decodeURIComponent(v || "");
+  });
+  if (params.access_token) {
+    // Clean the hash so it doesn't linger in the URL
+    history.replaceState(null, "", window.location.pathname + window.location.search);
+    return params.access_token;
+  }
+  return null;
+}
+
+/**
+ * Redirect to ArcGIS OAuth authorize endpoint.
+ * Uses the already-registered redirect URI (the app's own URL).
+ */
+function redirectToLogin() {
+  const redirectUri = window.location.origin;
+  const authUrl =
+    ARC_PORTAL +
+    "/sharing/rest/oauth2/authorize?" +
+    "client_id=" + ARC_APP_ID +
+    "&response_type=token" +
+    "&redirect_uri=" + encodeURIComponent(redirectUri) +
+    "&expiration=120";
+  window.location.href = authUrl;
+}
 
 interface Props {
   stormReportCount: number;
@@ -40,31 +77,37 @@ export default function ArcGISMap({ stormReportCount, active }: Props) {
   const labelLayerRef = useRef<GraphicsLayer | null>(null);
   const animFrameRef = useRef<number>(0);
 
-  // Initialize map with OAuth
+  // OAuth: check for token in hash, or redirect to login
+  useEffect(() => {
+    const token = extractTokenFromHash();
+    if (token) {
+      IdentityManager.registerToken({
+        server: ARC_PORTAL + "/sharing",
+        token: token,
+      });
+    } else {
+      // Check if we already have a credential
+      IdentityManager.checkSignInStatus(ARC_PORTAL + "/sharing").catch(() => {
+        redirectToLogin();
+      });
+    }
+  }, []);
+
+  // Initialize map once authenticated
   useEffect(() => {
     if (!containerRef.current) return;
 
-    const clientId = process.env.NEXT_PUBLIC_ARCGIS_CLIENT_ID || "";
-
-    // Register OAuth app for ArcGIS authentication
-    const portalUrl = "https://arc-nhq-gis.maps.arcgis.com";
-    const oauthInfo = new OAuthInfo({
-      appId: clientId,
-      portalUrl,
-      popup: true,
-    });
-    IdentityManager.registerOAuthInfos([oauthInfo]);
-
-    // Check if already signed in, if not trigger sign-in
-    IdentityManager.checkSignInStatus(portalUrl + "/sharing")
-      .then(() => initMap())
-      .catch(() => {
-        IdentityManager.getCredential(portalUrl + "/sharing")
-          .then(() => initMap())
-          .catch((err) => console.error("ArcGIS auth failed:", err));
-      });
-
     let view: MapView | null = null;
+    let cancelled = false;
+
+    IdentityManager.checkSignInStatus(ARC_PORTAL + "/sharing")
+      .then(() => {
+        if (cancelled || !containerRef.current) return;
+        initMap();
+      })
+      .catch(() => {
+        // Not signed in yet — login redirect will handle it
+      });
 
     function initMap() {
       if (!containerRef.current) return;
@@ -82,44 +125,45 @@ export default function ArcGISMap({ stormReportCount, active }: Props) {
         constraints: { minZoom: 9, maxZoom: 18 },
       });
 
-    // Create layers in order (bottom to top)
-    const polygonLayer = new GraphicsLayer({ title: "Warning Polygon" });
-    const stormGlowLayer = new GraphicsLayer({ title: "Storm Glow" });
-    const stormLayer = new GraphicsLayer({ title: "Storm Track" });
-    const labelLayer = new GraphicsLayer({ title: "Storm Labels" });
+      // Create layers in order (bottom to top)
+      const polygonLayer = new GraphicsLayer({ title: "Warning Polygon" });
+      const stormGlowLayer = new GraphicsLayer({ title: "Storm Glow" });
+      const stormLayer = new GraphicsLayer({ title: "Storm Track" });
+      const labelLayer = new GraphicsLayer({ title: "Storm Labels" });
 
-    map.addMany([polygonLayer, stormGlowLayer, stormLayer, labelLayer]);
+      map.addMany([polygonLayer, stormGlowLayer, stormLayer, labelLayer]);
 
-    polygonLayerRef.current = polygonLayer;
-    stormLayerRef.current = stormLayer;
-    stormGlowLayerRef.current = stormGlowLayer;
-    labelLayerRef.current = labelLayer;
-    viewRef.current = view;
+      polygonLayerRef.current = polygonLayer;
+      stormLayerRef.current = stormLayer;
+      stormGlowLayerRef.current = stormGlowLayer;
+      labelLayerRef.current = labelLayer;
+      viewRef.current = view;
 
-    // Pulse animation
-    let growing = true;
-    let glowSize = 30;
-    const animate = () => {
-      if (stormGlowLayerRef.current) {
-        const graphics = stormGlowLayerRef.current.graphics;
-        graphics.forEach((g) => {
-          if (g.symbol?.type === "simple-marker") {
-            const sym = (g.symbol as SimpleMarkerSymbol).clone();
-            sym.size = glowSize;
-            sym.color.a = 0.3 + 0.3 * Math.sin(performance.now() / 300);
-            g.symbol = sym;
-          }
-        });
-      }
-      glowSize += growing ? 0.3 : -0.3;
-      if (glowSize > 45) growing = false;
-      if (glowSize < 25) growing = true;
+      // Pulse animation
+      let growing = true;
+      let glowSize = 30;
+      const animate = () => {
+        if (stormGlowLayerRef.current) {
+          const graphics = stormGlowLayerRef.current.graphics;
+          graphics.forEach((g) => {
+            if (g.symbol?.type === "simple-marker") {
+              const sym = (g.symbol as SimpleMarkerSymbol).clone();
+              sym.size = glowSize;
+              sym.color.a = 0.3 + 0.3 * Math.sin(performance.now() / 300);
+              g.symbol = sym;
+            }
+          });
+        }
+        glowSize += growing ? 0.3 : -0.3;
+        if (glowSize > 45) growing = false;
+        if (glowSize < 25) growing = true;
+        animFrameRef.current = requestAnimationFrame(animate);
+      };
       animFrameRef.current = requestAnimationFrame(animate);
-    };
-    animFrameRef.current = requestAnimationFrame(animate);
-    } // end initMap
+    }
 
     return () => {
+      cancelled = true;
       cancelAnimationFrame(animFrameRef.current);
       if (view) view.destroy();
     };
@@ -151,7 +195,6 @@ export default function ArcGISMap({ stormReportCount, active }: Props) {
       }),
     );
 
-    // Zoom to polygon
     if (polygon.extent) {
       viewRef.current?.goTo(polygon.extent.expand(1.3), { duration: 1500 });
     }
@@ -175,7 +218,6 @@ export default function ArcGISMap({ stormReportCount, active }: Props) {
     if (visible.length >= 2) {
       const paths = visible.map((r) => [r.lon, r.lat]);
 
-      // Line glow
       stormLayer.add(
         new Graphic({
           geometry: new Polyline({
@@ -189,7 +231,6 @@ export default function ArcGISMap({ stormReportCount, active }: Props) {
         }),
       );
 
-      // Line core
       stormLayer.add(
         new Graphic({
           geometry: new Polyline({
@@ -212,7 +253,6 @@ export default function ArcGISMap({ stormReportCount, active }: Props) {
         spatialReference: { wkid: 4326 },
       });
 
-      // Glow circle
       glowLayer.add(
         new Graphic({
           geometry: pt,
@@ -225,7 +265,6 @@ export default function ArcGISMap({ stormReportCount, active }: Props) {
         }),
       );
 
-      // Dot
       stormLayer.add(
         new Graphic({
           geometry: pt,
@@ -238,7 +277,6 @@ export default function ArcGISMap({ stormReportCount, active }: Props) {
         }),
       );
 
-      // Letter label
       lblLayer.add(
         new Graphic({
           geometry: pt,
