@@ -47,18 +47,22 @@ export default function ArcGISMap({ stormReportCount, active }: Props) {
     const clientId = process.env.NEXT_PUBLIC_ARCGIS_CLIENT_ID || "";
 
     // Register OAuth app for ArcGIS authentication
+    const portalUrl = "https://arc-nhq-gis.maps.arcgis.com";
     const oauthInfo = new OAuthInfo({
       appId: clientId,
-      portalUrl: "https://www.arcgis.com",
-      popup: false,
+      portalUrl,
+      popup: true,
     });
     IdentityManager.registerOAuthInfos([oauthInfo]);
 
     // Check if already signed in, if not trigger sign-in
-    IdentityManager.checkSignInStatus(oauthInfo.portalUrl + "/sharing")
-      .catch(() => IdentityManager.getCredential(oauthInfo.portalUrl + "/sharing"))
+    IdentityManager.checkSignInStatus(portalUrl + "/sharing")
       .then(() => initMap())
-      .catch((err) => console.error("ArcGIS auth failed:", err));
+      .catch(() => {
+        IdentityManager.getCredential(portalUrl + "/sharing")
+          .then(() => initMap())
+          .catch((err) => console.error("ArcGIS auth failed:", err));
+      });
 
     let view: MapView | null = null;
 
