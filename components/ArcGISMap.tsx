@@ -12,13 +12,14 @@ import SimpleMarkerSymbol from "@arcgis/core/symbols/SimpleMarkerSymbol";
 import SimpleLineSymbol from "@arcgis/core/symbols/SimpleLineSymbol";
 import SimpleFillSymbol from "@arcgis/core/symbols/SimpleFillSymbol";
 import TextSymbol from "@arcgis/core/symbols/TextSymbol";
+import PictureMarkerSymbol from "@arcgis/core/symbols/PictureMarkerSymbol";
 import IdentityManager from "@arcgis/core/identity/IdentityManager";
 import { STORM_REPORTS } from "@/lib/storm-reports";
+import assetsJson from "@/data/pinellas_assets.json";
 
 const ARC_PORTAL = "https://arc-nhq-gis.maps.arcgis.com";
 const ARC_APP_ID = process.env.NEXT_PUBLIC_ARCGIS_CLIENT_ID || "";
 
-// Warning polygon coordinates (same as cascade2)
 const WARNING_POLYGON = [
   [-82.8714, 27.8383],
   [-82.6124, 27.8383],
@@ -27,41 +28,28 @@ const WARNING_POLYGON = [
   [-82.8714, 27.8383],
 ];
 
-/**
- * Extract OAuth token from URL hash (after redirect back from ArcGIS).
- * Returns the token string or null.
- */
-function extractTokenFromHash(): string | null {
-  const hash = window.location.hash.substring(1);
-  if (!hash) return null;
-  const params: Record<string, string> = {};
-  hash.split("&").forEach((part) => {
-    const [k, v] = part.split("=");
-    params[k] = decodeURIComponent(v || "");
-  });
-  if (params.access_token) {
-    // Clean the hash so it doesn't linger in the URL
-    history.replaceState(null, "", window.location.pathname + window.location.search);
-    return params.access_token;
-  }
-  return null;
+// Asset type → color mapping (matches cascade2)
+const ASSET_COLORS: Record<string, string> = {
+  red_cross: "#ED1B2E",
+  school: "#3b82f6",
+  fire_station: "#ef4444",
+  police_station: "#6366f1",
+  mobile_home_park: "#b45309",
+  hospital: "#10b981",
+};
+
+interface RawAsset {
+  id: string;
+  type: string;
+  name: string;
+  lat: number;
+  lon: number;
+  address: string;
+  city: string;
+  attrs: Record<string, unknown>;
 }
 
-/**
- * Redirect to ArcGIS OAuth authorize endpoint.
- * Uses the already-registered redirect URI (the app's own URL).
- */
-function redirectToLogin() {
-  const redirectUri = window.location.origin;
-  const authUrl =
-    ARC_PORTAL +
-    "/sharing/rest/oauth2/authorize?" +
-    "client_id=" + ARC_APP_ID +
-    "&response_type=token" +
-    "&redirect_uri=" + encodeURIComponent(redirectUri) +
-    "&expiration=120";
-  window.location.href = authUrl;
-}
+const ASSETS = (assetsJson as { assets: RawAsset[] }).assets;
 
 interface Props {
   stormReportCount: number;
@@ -71,50 +59,65 @@ interface Props {
 export default function ArcGISMap({ stormReportCount, active }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<MapView | null>(null);
+  const mapReadyRef = useRef(false);
   const polygonLayerRef = useRef<GraphicsLayer | null>(null);
   const stormLayerRef = useRef<GraphicsLayer | null>(null);
   const stormGlowLayerRef = useRef<GraphicsLayer | null>(null);
   const labelLayerRef = useRef<GraphicsLayer | null>(null);
   const animFrameRef = useRef<number>(0);
 
-  // OAuth: check for token in hash, or redirect to login
-  useEffect(() => {
-    const token = extractTokenFromHash();
-    if (token) {
-      IdentityManager.registerToken({
-        server: ARC_PORTAL + "/sharing",
-        token: token,
-      });
-    } else {
-      // Check if we already have a credential
-      IdentityManager.checkSignInStatus(ARC_PORTAL + "/sharing").catch(() => {
-        redirectToLogin();
-      });
-    }
-  }, []);
-
-  // Initialize map once authenticated
+  // Single useEffect: handle OAuth then init map
   useEffect(() => {
     if (!containerRef.current) return;
 
     let view: MapView | null = null;
-    let cancelled = false;
 
-    IdentityManager.checkSignInStatus(ARC_PORTAL + "/sharing")
-      .then(() => {
-        if (cancelled || !containerRef.current) return;
+    // 1. Check for OAuth token in URL hash (redirect return)
+    const hash = window.location.hash.substring(1);
+    if (hash.includes("access_token=")) {
+      const params = new URLSearchParams(hash);
+      const token = params.get("access_token");
+      const expiresIn = parseInt(params.get("expires_in") || "7200");
+      if (token) {
+        sessionStorage.setItem("agol-token", token);
+        sessionStorage.setItem("agol-token-exp", String(Date.now() + expiresIn * 1000));
+        history.replaceState(null, "", window.location.pathname + window.location.search);
+        IdentityManager.registerToken({
+          server: ARC_PORTAL + "/sharing",
+          token,
+        });
         initMap();
-      })
-      .catch(() => {
-        // Not signed in yet — login redirect will handle it
+        return cleanup;
+      }
+    }
+
+    // 2. Check sessionStorage for existing token
+    const savedToken = sessionStorage.getItem("agol-token");
+    const savedExp = parseInt(sessionStorage.getItem("agol-token-exp") || "0");
+    if (savedToken && Date.now() < savedExp) {
+      IdentityManager.registerToken({
+        server: ARC_PORTAL + "/sharing",
+        token: savedToken,
       });
+      initMap();
+      return cleanup;
+    }
+
+    // 3. No valid token — redirect to ArcGIS OAuth
+    const redirectUri = window.location.origin;
+    const authUrl =
+      ARC_PORTAL +
+      "/sharing/rest/oauth2/authorize?" +
+      "client_id=" + ARC_APP_ID +
+      "&response_type=token" +
+      "&redirect_uri=" + encodeURIComponent(redirectUri) +
+      "&expiration=120";
+    window.location.href = authUrl;
 
     function initMap() {
       if (!containerRef.current) return;
 
-      const map = new Map({
-        basemap: "dark-gray-vector",
-      });
+      const map = new Map({ basemap: "dark-gray-vector" });
 
       view = new MapView({
         container: containerRef.current,
@@ -125,27 +128,51 @@ export default function ArcGISMap({ stormReportCount, active }: Props) {
         constraints: { minZoom: 9, maxZoom: 18 },
       });
 
-      // Create layers in order (bottom to top)
+      // Asset layer (bottom)
+      const assetLayer = new GraphicsLayer({ title: "Assets" });
+      // Warning polygon
       const polygonLayer = new GraphicsLayer({ title: "Warning Polygon" });
+      // Storm layers (top)
       const stormGlowLayer = new GraphicsLayer({ title: "Storm Glow" });
       const stormLayer = new GraphicsLayer({ title: "Storm Track" });
       const labelLayer = new GraphicsLayer({ title: "Storm Labels" });
 
-      map.addMany([polygonLayer, stormGlowLayer, stormLayer, labelLayer]);
+      map.addMany([assetLayer, polygonLayer, stormGlowLayer, stormLayer, labelLayer]);
 
       polygonLayerRef.current = polygonLayer;
       stormLayerRef.current = stormLayer;
       stormGlowLayerRef.current = stormGlowLayer;
       labelLayerRef.current = labelLayer;
       viewRef.current = view;
+      mapReadyRef.current = true;
 
-      // Pulse animation
+      // Add asset points
+      for (const a of ASSETS) {
+        const color = ASSET_COLORS[a.type] || "#999";
+        assetLayer.add(
+          new Graphic({
+            geometry: new Point({ longitude: a.lon, latitude: a.lat }),
+            symbol: new SimpleMarkerSymbol({
+              style: "circle",
+              color,
+              size: 8,
+              outline: { color: [255, 255, 255, 0.8], width: 1 },
+            }),
+            attributes: { name: a.name, type: a.type, address: a.address, city: a.city },
+            popupTemplate: {
+              title: "{name}",
+              content: "{type} — {address}, {city}",
+            },
+          }),
+        );
+      }
+
+      // Pulse animation for storm glow
       let growing = true;
       let glowSize = 30;
       const animate = () => {
         if (stormGlowLayerRef.current) {
-          const graphics = stormGlowLayerRef.current.graphics;
-          graphics.forEach((g) => {
+          stormGlowLayerRef.current.graphics.forEach((g) => {
             if (g.symbol?.type === "simple-marker") {
               const sym = (g.symbol as SimpleMarkerSymbol).clone();
               sym.size = glowSize;
@@ -162,11 +189,13 @@ export default function ArcGISMap({ stormReportCount, active }: Props) {
       animFrameRef.current = requestAnimationFrame(animate);
     }
 
-    return () => {
-      cancelled = true;
+    function cleanup() {
       cancelAnimationFrame(animFrameRef.current);
       if (view) view.destroy();
-    };
+    }
+
+    return cleanup;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Draw warning polygon when activated
@@ -174,7 +203,6 @@ export default function ArcGISMap({ stormReportCount, active }: Props) {
     const layer = polygonLayerRef.current;
     if (!layer) return;
     layer.removeAll();
-
     if (!active) return;
 
     const polygon = new Polygon({
@@ -187,10 +215,7 @@ export default function ArcGISMap({ stormReportCount, active }: Props) {
         geometry: polygon,
         symbol: new SimpleFillSymbol({
           color: [237, 27, 46, 0.14],
-          outline: new SimpleLineSymbol({
-            color: [237, 27, 46, 1],
-            width: 2,
-          }),
+          outline: new SimpleLineSymbol({ color: [237, 27, 46, 1], width: 2 }),
         }),
       }),
     );
@@ -214,45 +239,24 @@ export default function ArcGISMap({ stormReportCount, active }: Props) {
     const visible = STORM_REPORTS.slice(0, stormReportCount);
     if (visible.length === 0) return;
 
-    // Connecting line
     if (visible.length >= 2) {
       const paths = visible.map((r) => [r.lon, r.lat]);
-
       stormLayer.add(
         new Graphic({
-          geometry: new Polyline({
-            paths: [paths],
-            spatialReference: { wkid: 4326 },
-          }),
-          symbol: new SimpleLineSymbol({
-            color: [251, 191, 36, 0.6],
-            width: 18,
-          }),
+          geometry: new Polyline({ paths: [paths], spatialReference: { wkid: 4326 } }),
+          symbol: new SimpleLineSymbol({ color: [251, 191, 36, 0.6], width: 18 }),
         }),
       );
-
       stormLayer.add(
         new Graphic({
-          geometry: new Polyline({
-            paths: [paths],
-            spatialReference: { wkid: 4326 },
-          }),
-          symbol: new SimpleLineSymbol({
-            color: [220, 38, 38, 1],
-            width: 5,
-          }),
+          geometry: new Polyline({ paths: [paths], spatialReference: { wkid: 4326 } }),
+          symbol: new SimpleLineSymbol({ color: [220, 38, 38, 1], width: 5 }),
         }),
       );
     }
 
-    // Points
     for (const r of visible) {
-      const pt = new Point({
-        longitude: r.lon,
-        latitude: r.lat,
-        spatialReference: { wkid: 4326 },
-      });
-
+      const pt = new Point({ longitude: r.lon, latitude: r.lat });
       glowLayer.add(
         new Graphic({
           geometry: pt,
@@ -264,7 +268,6 @@ export default function ArcGISMap({ stormReportCount, active }: Props) {
           }),
         }),
       );
-
       stormLayer.add(
         new Graphic({
           geometry: pt,
@@ -276,7 +279,6 @@ export default function ArcGISMap({ stormReportCount, active }: Props) {
           }),
         }),
       );
-
       lblLayer.add(
         new Graphic({
           geometry: pt,
