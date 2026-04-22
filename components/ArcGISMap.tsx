@@ -49,7 +49,7 @@ export default function ArcGISMap({ stormReportCount, active }: Props) {
     // Register OAuth app for ArcGIS authentication
     const oauthInfo = new OAuthInfo({
       appId: clientId,
-      portalUrl: "https://arc-nhq-gis.maps.arcgis.com",
+      portalUrl: "https://www.arcgis.com",
       popup: false,
     });
     IdentityManager.registerOAuthInfos([oauthInfo]);
